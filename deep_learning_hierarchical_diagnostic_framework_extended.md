@@ -6,31 +6,22 @@
 필요한 가지로만 깊게 들어가고, 진단을 실제 개선과 인과 검증까지 연결하는
 것**이다.
 
-``` mermaid
-flowchart TD
- A["성능이 기대보다 낮다"] --> B["1. Localization"]
- B --> X["입력·데이터 의존"]
- B --> R["2. Representation Diagnosis"]
- B --> D["3. Learning Dynamics"]
- X --> XA["XAI · Perturbation · Counterfactual"]
- R --> G["Global Geometry<br/>Spectrum · Rank · Margin · Probe · CKA"]
- G --> M["Local / Manifold<br/>Neighborhood · ID · Local PCA · Tangent"]
- G --> P["Distribution Geometry<br/>MMD · Wasserstein/Sinkhorn · Support · Coverage"]
- G --> D
- M --> D
- P --> D
- D --> L["Gradient/Update → Representation Dynamics → Regime"]
- L --> H["NTK / Hessian / Fisher / Jacobian"]
- H --> LL["필요할 때 Loss-Landscape<br/>Perturbation → Restart → Interpolation → Connectivity"]
- XA --> S["4. Steer / Improve"]
- R --> S
- D --> S
- LL --> S
- S --> ABL["Low-Fidelity Screening → Controlled Ablation"]
- ABL --> C["5. Causal Validation"]
- C --> MI["MI · Ablation · Direction Removal · Patching"]
- MI --> N["새 Baseline"]
- N --> B
+```text
+딥러닝 문제진단 프레임워크
+├─ 1. 현상 위치화: 어디서 못하는가?
+│  └─ 입력·데이터 의존: XAI · perturbation · counterfactual
+├─ 2. 표현 진단: 무엇을 어떻게 표현했는가?
+│  ├─ 전역 기하: spectrum · rank · margin · probe · CKA
+│  ├─ 국소·다양체 기하: neighborhood · ID · local PCA · tangent
+│  └─ 분포 기하: MMD · Wasserstein/Sinkhorn · support · coverage
+├─ 3. 학습 동역학: 왜 그렇게 학습되었는가?
+│  ├─ gradient/update · representation dynamics · regime
+│  ├─ NTK · Hessian · Fisher · Jacobian
+│  └─ 필요할 때 loss landscape: perturbation · restart · interpolation · connectivity
+├─ 4. 개선: 어디를 어떻게 고칠 것인가?
+│  └─ low-fidelity screening → controlled ablation
+└─ 5. 인과 검증: 정말 그것이 원인이었는가?
+   └─ MI · ablation · direction removal · patching → 새 baseline
 ```
 
 > **1. 어디서 못하는가? → 2. 무엇을 잘못 표현했는가? → 3. 왜 그렇게
@@ -126,7 +117,7 @@ geodesic, curvature, TDA는 이 구조 자체가 연구 질문일 때만 추가�
 -   class geometry는 괜찮은데 domain별 성능 차이가 지속
 
 표현 사상을 $z_\theta:\mathcal X\to\mathcal Z$, 입력분포를 $P_X$라 하면
-표현분포는 pushforward $(z_\theta)_\#P_X$이다. 목적은 평균 feature가
+표현분포는 pushforward $(z_\theta)_{\sharp}P_X$이다. 목적은 평균 feature가
 아니라 **sample 집단 전체의 분포 차이**를 보는 것이다.
 
 ### 비용 순서
