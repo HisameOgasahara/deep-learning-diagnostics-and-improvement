@@ -64,24 +64,79 @@ def _effective_rank(x, max_tokens=64):
         return None
 
 
-def _save_spatial_rms(x, path):
-    if x.ndim < 4:
+def _infer_grid(seq_len, input_shape):
+    """Infer the 2-D token grid from flattened Anima/Cosmos Predict2 tokens.
+
+    Main DiT attention receives representation tensors shaped [B, S, C] after
+    patch embedding/flattening.  We recover H_token x W_token by choosing the
+    exact factor pair of S whose aspect ratio is closest to the model input's
+    latent H:W ratio.  This avoids assuming a fixed resolution or patch size.
+    """
+    if seq_len <= 0:
         return None
+
+    target_ratio = 1.0
+    if input_shape and len(input_shape) >= 2:
+        h, w = int(input_shape[-2]), int(input_shape[-1])
+        if h > 0 and w > 0:
+            target_ratio = h / w
+
+    best = None
+    best_score = float("inf")
+    limit = int(seq_len ** 0.5)
+    for h_tok in range(1, limit + 1):
+        if seq_len % h_tok != 0:
+            continue
+        w_tok = seq_len // h_tok
+        for hh, ww in ((h_tok, w_tok), (w_tok, h_tok)):
+            ratio = hh / ww
+            score = abs(np.log((ratio + 1e-12) / (target_ratio + 1e-12)))
+            if score < best_score:
+                best_score = score
+                best = (hh, ww)
+    return best
+
+
+def _save_spatial_rms(x, path, input_shape=None):
+    """Save a 2-D RMS map for Anima/Cosmos Predict2 representations.
+
+    attn1_patch/attn2_patch are called before Q/K/V projection.  For Anima's
+    main DiT this representation is normally [B, S, C], with S being flattened
+    spatial patch tokens.  Older code only accepted 4-D/5-D tensors, so maps
+    were silently skipped.  This version explicitly reconstructs [H_token,
+    W_token] from S and the current model-input aspect ratio.
+    """
     with torch.no_grad():
         z = x.detach()
-        if z.ndim == 5:
-            z = z[0]
-            z = z.float().pow(2).mean(dim=-1).sqrt()
-            z = z.mean(dim=0)
-        elif z.ndim == 4:
+
+        if z.ndim == 3:  # [B, S, C]
+            seq_len = int(z.shape[1])
+            grid = _infer_grid(seq_len, input_shape)
+            if grid is None:
+                return None
+            h_tok, w_tok = grid
+            token_rms = z[0].float().pow(2).mean(dim=-1).sqrt()
+            if token_rms.numel() != h_tok * w_tok:
+                return None
+            arr = token_rms.reshape(h_tok, w_tok).cpu().numpy()
+
+        elif z.ndim == 5:  # already [B, T, H, W, C]
             z = z[0].float().pow(2).mean(dim=-1).sqrt()
-            if z.ndim == 3:
-                z = z.mean(dim=0)
+            arr = z.mean(dim=0).cpu().numpy()
+
+        elif z.ndim == 4:
+            # Preserve support for already-spatial tensors [B, H, W, C].
+            z = z[0].float().pow(2).mean(dim=-1).sqrt()
+            if z.ndim != 2:
+                return None
+            arr = z.cpu().numpy()
+
         else:
             return None
-        arr = z.cpu().numpy()
+
         if arr.ndim != 2:
             return None
+
         lo, hi = np.nanpercentile(arr, [1.0, 99.0])
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = float(np.nanmin(arr)), float(np.nanmax(arr) + 1e-8)
@@ -137,8 +192,11 @@ def _record_attention(kind, q, k, v, extra_options):
         rec["q_effective_rank"] = _effective_rank(q, state["max_rank_tokens"])
         map_name = f"{kind}_call{call_index:04d}_sigma{(sigma if sigma is not None else -1):.6f}_block{block_index:02d}_q_rms.png"
         map_path = Path(state["maps_dir"]) / map_name
-        rec["q_rms_map_shape"] = _save_spatial_rms(q, map_path)
-        rec["q_rms_map"] = str(map_path)
+        input_shape = state["input_shapes"].get(call_index)
+        rec["model_input_shape"] = input_shape
+        rec["q_rms_map_shape"] = _save_spatial_rms(q, map_path, input_shape=input_shape)
+        if rec["q_rms_map_shape"] is not None:
+            rec["q_rms_map"] = str(map_path)
 
     _append_jsonl(state, rec)
 
@@ -198,6 +256,7 @@ class AnimaInferenceDiagnostics:
             "snapshot_every_n_calls": int(snapshot_every_n_calls),
             "max_rank_tokens": int(max_rank_tokens),
             "call_index": 0,
+            "input_shapes": {},
             "lock": threading.Lock(),
         }
         _RECORDER[sid] = state
@@ -209,7 +268,7 @@ class AnimaInferenceDiagnostics:
                 "record_every_n_calls": state["record_every_n_calls"],
                 "snapshot_every_n_calls": state["snapshot_every_n_calls"],
                 "max_rank_tokens": state["max_rank_tokens"],
-                "note": "attn1/attn2 patch inputs are recorded before q/k/v projection; maps are representation RMS maps, not DAAM attention probabilities."
+                "note": "attn1/attn2 patch inputs are recorded before q/k/v projection. For flattened [B,S,C] Anima tokens, spatial RMS maps infer H_token x W_token from S and the current model-input aspect ratio. These are representation RMS maps, not DAAM attention probabilities."
             }, f, indent=2)
 
         m = model.clone()
@@ -230,6 +289,9 @@ class AnimaInferenceDiagnostics:
             c["transformer_options"] = transformer_options
 
             inp = args["input"]
+            with state["lock"]:
+                state["input_shapes"][call_index] = list(inp.shape)
+
             call_rec = {
                 "time": time.time(),
                 "session": sid,
