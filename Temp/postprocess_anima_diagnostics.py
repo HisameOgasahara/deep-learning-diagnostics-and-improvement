@@ -31,7 +31,7 @@ print('session:', session)
 print('rows:', len(df))
 print('csv:', csv_path)
 
-mc = df[df['kind'] == 'model_call'].copy()
+mc = df[df['kind'] == 'model_call'].copy() if 'kind' in df.columns else pd.DataFrame()
 if len(mc):
     mc = mc.sort_values('call_index')
     fig = plt.figure(figsize=(9, 4.5))
@@ -46,7 +46,7 @@ if len(mc):
     plt.close(fig)
     print('saved:', out)
 
-a1 = df[df['kind'] == 'attn1'].copy()
+a1 = df[df['kind'] == 'attn1'].copy() if 'kind' in df.columns else pd.DataFrame()
 if len(a1) and 'q_rms' in a1.columns:
     pivot = a1.pivot_table(index='block', columns='call_index', values='q_rms', aggfunc='mean')
     if pivot.size:
@@ -64,7 +64,7 @@ if len(a1) and 'q_rms' in a1.columns:
         plt.close(fig)
         print('saved:', out)
 
-rank_df = a1.dropna(subset=['q_effective_rank']) if 'q_effective_rank' in a1.columns else pd.DataFrame()
+rank_df = a1.dropna(subset=['q_effective_rank']) if len(a1) and 'q_effective_rank' in a1.columns else pd.DataFrame()
 if len(rank_df):
     fig = plt.figure(figsize=(9, 5))
     for block, g in rank_df.groupby('block'):
@@ -82,11 +82,31 @@ if len(rank_df):
     print('saved:', out)
 
 cols = [c for c in ['kind','call_index','block','q_dtype','k_dtype','v_dtype','q_device','k_device','v_device'] if c in df.columns]
-if cols:
+if cols and 'kind' in df.columns:
     mismatch = df[df['kind'].isin(['attn1','attn2'])][cols].drop_duplicates()
     out = session / 'dtype_device_table.csv'
     mismatch.to_csv(out, index=False)
     print('saved:', out)
+
+# DAAM-like cross-attention map index: one row per denoising call/block/text-token.
+if 'kind' in df.columns:
+    ca = df[df['kind'] == 'cross_attention_map'].copy()
+    if len(ca):
+        ca_cols = [c for c in [
+            'call_index','sigma','block','text_token_index','text_key_count',
+            'map_shape','map_path','gif_key'
+        ] if c in ca.columns]
+        out = session / 'cross_attention_maps.csv'
+        ca[ca_cols].sort_values(['block','text_token_index','call_index']).to_csv(out, index=False)
+        print('saved:', out)
+
+print('\nGIFs:')
+gifs = sorted((session / 'gifs').glob('*.gif')) if (session / 'gifs').exists() else []
+if gifs:
+    for p in gifs:
+        print(p.relative_to(session))
+else:
+    print('(none)')
 
 print('\nFiles:')
 for p in sorted(session.rglob('*')):
