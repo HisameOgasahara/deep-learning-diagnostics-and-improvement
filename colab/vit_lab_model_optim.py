@@ -111,7 +111,9 @@ TRACKED_PARAM_NAMES = [
 def zeropower_via_newton_schulz5(G, steps=5, eps=1e-7):
     assert G.ndim == 2
     a, b, c = 3.4445, -4.7750, 2.0315
-    X = G.bfloat16()
+    # T4 is compute capability 7.5. Use float32 here rather than relying on
+    # bfloat16 matrix kernels that are intended for newer GPUs.
+    X = G.float()
     transposed = X.shape[0] > X.shape[1]
     if transposed:
         X = X.T
@@ -126,7 +128,7 @@ def zeropower_via_newton_schulz5(G, steps=5, eps=1e-7):
 
 
 class LocalMuon(torch.optim.Optimizer):
-    """Fallback for Colab runtimes that do not yet expose torch.optim.Muon."""
+    """Single-GPU Muon fallback, including a T4-safe float32 NS path."""
 
     def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.01,
                  nesterov=True, ns_steps=5):
@@ -180,6 +182,15 @@ def split_muon_parameters(model):
     return muon_params, aux_params
 
 
+def native_muon_is_safe_here():
+    if not hasattr(torch.optim, "Muon"):
+        return False
+    if not torch.cuda.is_available():
+        return True
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 8
+
+
 def make_optimizer(model, name):
     if name == "sgd":
         return torch.optim.SGD(model.parameters(), lr=0.03, momentum=0.9, weight_decay=5e-4)
@@ -192,7 +203,7 @@ def make_optimizer(model, name):
         )
     if name == "muon":
         muon_params, aux_params = split_muon_parameters(model)
-        if hasattr(torch.optim, "Muon"):
+        if native_muon_is_safe_here():
             muon_opt = torch.optim.Muon(
                 muon_params, lr=0.02, momentum=0.95, weight_decay=0.01
             )
