@@ -160,12 +160,6 @@ def _conditional_only(x, opt):
 
 
 def _selected_attention(q, k, token_indices, opt, key_chunk=64, token_chunk=24):
-    """DAAM-style positive cross-attention capture.
-
-    Returns dict[token] -> ndarray [B_cond, Q]. Heads are SUMMED, matching
-    comfyui-daam BaseAttentionPatcher._up_sample_attn (constant head scaling is
-    irrelevant after final DAAM min-max visualization).
-    """
     q = _conditional_only(q, opt)
     k = _conditional_only(k, opt)
     qf = q.detach().reshape(q.shape[0], -1, q.shape[-2], q.shape[-1]).float()
@@ -189,7 +183,7 @@ def _selected_attention(q, k, token_indices, opt, key_chunk=64, token_chunk=24):
     for s in range(0, len(valid), token_chunk):
         ids = valid[s:s + token_chunk]
         logits = torch.einsum('bqhd,bkhd->bqhk', qf, kf[:, ids]) * scale
-        probs = torch.exp(logits - log_denom[..., None]).sum(2)  # [B,Q,T], sum heads
+        probs = torch.exp(logits - log_denom[..., None]).sum(2)
         probs = probs.permute(2, 0, 1).contiguous().cpu().numpy()
         for j, tok in enumerate(ids):
             out[tok] = probs[j]
@@ -232,10 +226,9 @@ def _flush_call(st, ci):
     with st['lock']:
         keys = [k for k in st['call_accum'] if k[0] == ci]
         for key in keys:
-            (call_idx, batch_idx, h, w, tok) = key
+            call_idx, batch_idx, h, w, tok = key
             total, count = st['call_accum'].pop(key)
-            arr = (total / max(count, 1)).astype(np.float32)  # mean layers within resolution/factor
-            rows.append((batch_idx, h, w, tok, count, arr))
+            rows.append((batch_idx, h, w, tok, count, (total / max(count, 1)).astype(np.float32)))
 
     for batch_idx, h, w, tok, layer_count, arr in rows:
         stem = f'call{ci:04d}_batch{batch_idx:02d}_res{h}x{w}_token{tok:03d}'
@@ -244,15 +237,9 @@ def _flush_call(st, ci):
         np.save(raw, arr)
         Image.fromarray(_rgb(_minmax(arr), st['colormap']), 'RGB').save(png)
         _append(st, {
-            'kind': 'timestep_token_map',
-            'call_index': ci,
-            'batch_index': batch_idx,
-            'resolution': [h, w],
-            'text_token_index': tok,
-            'layer_count': layer_count,
-            'sigma': st['sigmas'].get(ci),
-            'raw_npy': str(raw),
-            'png': str(png),
+            'kind': 'timestep_token_map', 'call_index': ci, 'batch_index': batch_idx,
+            'resolution': [h, w], 'text_token_index': tok, 'layer_count': layer_count,
+            'sigma': st['sigmas'].get(ci), 'raw_npy': str(raw), 'png': str(png),
         })
 
 
@@ -289,10 +276,7 @@ _install_hook()
 class AnimaTextEncodeWithTokenMapV2:
     @classmethod
     def INPUT_TYPES(cls):
-        return {'required': {
-            'clip': ('CLIP',),
-            'text': ('STRING', {'multiline': True, 'dynamicPrompts': True}),
-        }}
+        return {'required': {'clip': ('CLIP',), 'text': ('STRING', {'multiline': True, 'dynamicPrompts': True})}}
 
     RETURN_TYPES = ('CONDITIONING', 'ANIMA_TOKEN_MAP', 'STRING')
     RETURN_NAMES = ('conditioning', 'token_map', 'mapping_text')
@@ -307,12 +291,7 @@ class AnimaTextEncodeWithTokenMapV2:
         cond = output.pop('cond')
         pairs = _flat(tokens, 't5xxl')
         decoded = _detok(clip, pairs)
-        tm = {
-            'prompt': text,
-            'token_ids': [_tid(x) for x in pairs],
-            'token_texts': [_txt(x) for x in decoded],
-            '_clip': clip,
-        }
+        tm = {'prompt': text, 'token_ids': [_tid(x) for x in pairs], 'token_texts': [_txt(x) for x in decoded], '_clip': clip}
         return ([[cond, output]], tm, _mapping(tm))
 
 
@@ -333,17 +312,10 @@ class AnimaTokenMapViewerV2:
 
 
 class AnimaAttentionDiagnosticsV2:
-    """Collect raw positive-prompt token heatmaps during sampling.
-
-    Unlike the earlier V2 experiments, this node does NOT ask for words and does
-    NOT select heads/subtokens. It mirrors comfyui-daam's KSamplerDAAM role:
-    capture token heatmaps first, analyze arbitrary words later.
-    """
     @classmethod
     def INPUT_TYPES(cls):
         return {'required': {
-            'model': ('MODEL',),
-            'token_map': ('ANIMA_TOKEN_MAP', {'forceInput': True}),
+            'model': ('MODEL',), 'token_map': ('ANIMA_TOKEN_MAP', {'forceInput': True}),
             'snapshot_every_n_calls': ('INT', {'default': 1, 'min': 1, 'max': 100}),
             'max_map_side': ('INT', {'default': 64, 'min': 16, 'max': 256}),
             'colormap': (['turbo', 'inferno', 'viridis', 'magma', 'plasma', 'gray'], {'default': 'turbo'}),
@@ -359,42 +331,28 @@ class AnimaAttentionDiagnosticsV2:
         active = _active_token_indices(token_map)
         if not active:
             raise RuntimeError('No active T5 prompt tokens found.')
-
         sid = time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8]
         out = Path(output_root) / sid
-        for d in ('timestep_raw', 'timestep_maps', 'global'):
+        for d in ('timestep_raw', 'timestep_maps', 'global', 'individual'):
             (out / d).mkdir(parents=True, exist_ok=True)
-
         public = {k: v for k, v in token_map.items() if k != '_clip'}
         (out / 'token_map.json').write_text(json.dumps(public, ensure_ascii=False, indent=2), encoding='utf-8')
         (out / 'token_map.txt').write_text(_mapping(token_map), encoding='utf-8')
         (out / 'session.json').write_text(json.dumps({
-            'session': sid,
-            'active_token_indices': active,
-            'snapshot_every_n_calls': int(snapshot_every_n_calls),
-            'max_map_side': int(max_map_side),
+            'session': sid, 'active_token_indices': active,
+            'snapshot_every_n_calls': int(snapshot_every_n_calls), 'max_map_side': int(max_map_side),
             'colormap': colormap,
-            'aggregation': 'DAAM-style: sum heads -> resize -> mean layers within each timestep/resolution -> sum timesteps/resolutions -> mean subtokens for word -> resize to image -> min-max once',
-            'reference': 'nisaruj/comfyui-daam BaseAttentionPatcher + GlobalHeatMap semantics adapted to Anima/Cosmos Predict2',
+            'aggregation': 'global: sum heads -> mean layers within call/resolution -> sum calls/resolutions -> mean word subtokens -> resize -> min-max once; individual: same pre-aggregation call/resolution maps -> mean word subtokens -> resize -> min-max per map',
+            'reference': 'nisaruj/comfyui-daam semantics adapted to Anima/Cosmos Predict2',
         }, ensure_ascii=False, indent=2), encoding='utf-8')
 
         st = {
-            'active_tokens': active,
-            'call_stride': int(snapshot_every_n_calls),
-            'max_map_side': int(max_map_side),
-            'colormap': colormap,
-            'timestep_raw': str(out / 'timestep_raw'),
-            'timestep_maps': str(out / 'timestep_maps'),
-            'records': str(out / 'records.jsonl'),
-            'call_index': 0,
-            'call_accum': {},
-            'input_shapes': {},
-            'sigmas': {},
-            'observed_key_count': None,
-            'lock': threading.Lock(),
+            'active_tokens': active, 'call_stride': int(snapshot_every_n_calls), 'max_map_side': int(max_map_side),
+            'colormap': colormap, 'timestep_raw': str(out / 'timestep_raw'), 'timestep_maps': str(out / 'timestep_maps'),
+            'records': str(out / 'records.jsonl'), 'call_index': 0, 'call_accum': {}, 'input_shapes': {},
+            'sigmas': {}, 'observed_key_count': None, 'lock': threading.Lock(),
         }
         _REC[sid] = st
-
         m = model.clone()
         old = m.model_options.get('model_function_wrapper')
 
@@ -403,14 +361,10 @@ class AnimaAttentionDiagnosticsV2:
             with st['lock']:
                 ci = st['call_index']
                 st['call_index'] += 1
-            sigma = float(args['timestep'].max().detach().cpu())
             st['input_shapes'][ci] = list(args['input'].shape)
-            st['sigmas'][ci] = sigma
+            st['sigmas'][ci] = float(args['timestep'].max().detach().cpu())
             to = c.get('transformer_options', {}).copy()
-            to.update({
-                'anima_daam_v2_session': sid,
-                'anima_daam_v2_call_index': ci,
-            })
+            to.update({'anima_daam_v2_session': sid, 'anima_daam_v2_call_index': ci})
             c['transformer_options'] = to
             result = old(apply_model, args | {'c': c}) if old is not None else apply_model(args['input'], args['timestep'], **c)
             if ci % st['call_stride'] == 0:
@@ -434,26 +388,28 @@ def _records(session):
     return rows
 
 
+def _load_record_array(session, rec):
+    p = Path(rec.get('raw_npy', ''))
+    if not p.exists():
+        p = Path(session) / 'timestep_raw' / p.name
+    return np.load(p).astype(np.float32) if p.exists() else None
+
+
 def _global_token_map(session, batch_index, token_index):
     arrays = []
     for rec in _records(session):
         if rec.get('kind') != 'timestep_token_map':
             continue
-        if int(rec.get('batch_index', -1)) != int(batch_index):
+        if int(rec.get('batch_index', -1)) != int(batch_index) or int(rec.get('text_token_index', -1)) != int(token_index):
             continue
-        if int(rec.get('text_token_index', -1)) != int(token_index):
-            continue
-        p = Path(rec.get('raw_npy', ''))
-        if not p.exists():
-            p = Path(session) / 'timestep_raw' / p.name
-        if p.exists():
-            arrays.append(np.load(p).astype(np.float32))
+        a = _load_record_array(session, rec)
+        if a is not None:
+            arrays.append(a)
     if not arrays:
         return None
     target_h = max(a.shape[0] for a in arrays)
     target_w = max(a.shape[1] for a in arrays)
     aligned = [_resize_np(a, target_h, target_w) if a.shape != (target_h, target_w) else a for a in arrays]
-    # GlobalHeatMap semantics: sum over timesteps/resolution groups.
     return np.stack(aligned, axis=0).sum(axis=0)
 
 
@@ -461,8 +417,7 @@ def _word_global_map(session, token_map, word, batch_index):
     ids = _word_ids(token_map, word)
     if not ids:
         return None, []
-    maps = []
-    used = []
+    maps, used = [], []
     for tok in ids:
         m = _global_token_map(session, batch_index, tok)
         if m is not None:
@@ -470,8 +425,41 @@ def _word_global_map(session, token_map, word, batch_index):
             used.append(tok)
     if not maps:
         return None, ids
-    # DAAM compute_word_heat_map: mean global token maps over the token span.
     return np.stack(maps, axis=0).mean(axis=0), used
+
+
+def _word_individual_maps(session, token_map, word, batch_index):
+    """Return pre-global-aggregation word maps grouped by denoising call and resolution."""
+    ids = _word_ids(token_map, word)
+    if not ids:
+        return [], []
+    wanted = set(ids)
+    groups = {}
+    for rec in _records(session):
+        if rec.get('kind') != 'timestep_token_map' or int(rec.get('batch_index', -1)) != int(batch_index):
+            continue
+        tok = int(rec.get('text_token_index', -1))
+        if tok not in wanted:
+            continue
+        a = _load_record_array(session, rec)
+        if a is None:
+            continue
+        res = tuple(int(x) for x in rec.get('resolution', list(a.shape)))
+        key = (int(rec.get('call_index', -1)), res, rec.get('sigma'))
+        groups.setdefault(key, {})[tok] = a
+
+    out = []
+    for (call_index, res, sigma), token_arrays in sorted(groups.items(), key=lambda kv: kv[0][0]):
+        used = [tok for tok in ids if tok in token_arrays]
+        if not used:
+            continue
+        arrays = [token_arrays[tok] for tok in used]
+        th = max(a.shape[0] for a in arrays)
+        tw = max(a.shape[1] for a in arrays)
+        aligned = [_resize_np(a, th, tw) if a.shape != (th, tw) else a for a in arrays]
+        out.append({'call_index': call_index, 'resolution': res, 'sigma': sigma, 'token_ids': used,
+                    'raw': np.stack(aligned, axis=0).mean(axis=0)})
+    return out, ids
 
 
 def _resize_to_image(a, h, w):
@@ -495,15 +483,25 @@ def _caption(t, text):
     return torch.from_numpy(np.asarray(im).astype(np.float32) / 255.0)
 
 
+def _make_overlay(base, raw, h, w, cmap, alpha, caption, label):
+    resized = _resize_to_image(raw, h, w).cpu().numpy()
+    norm = _minmax(resized)
+    heat = torch.from_numpy(_rgb(norm, cmap).astype(np.float32) / 255.0)
+    over = ((1.0 - float(alpha)) * base + float(alpha) * heat).clamp(0, 1)
+    if caption:
+        over = _caption(over, label)
+    return over, heat, norm
+
+
 class AnimaAttentionOverlayV2:
-    """DAAMAnalyzer-style word heatmap + overlay."""
+    """DAAM-style global overlay plus optional pre-aggregation call/resolution overlays."""
     @classmethod
     def INPUT_TYPES(cls):
         return {'required': {
-            'images': ('IMAGE',),
-            'token_map': ('ANIMA_TOKEN_MAP', {'forceInput': True}),
+            'images': ('IMAGE',), 'token_map': ('ANIMA_TOKEN_MAP', {'forceInput': True}),
             'diagnostic_directory': ('STRING', {'forceInput': True}),
             'attention_words': ('STRING', {'multiline': True, 'default': 'arona'}),
+            'view_mode': (['global', 'individual', 'global + individual'], {'default': 'global'}),
             'alpha': ('FLOAT', {'default': 0.5, 'min': 0.0, 'max': 1.0, 'step': 0.05}),
             'caption': ('BOOLEAN', {'default': True}),
         }}
@@ -513,34 +511,51 @@ class AnimaAttentionOverlayV2:
     FUNCTION = 'overlay'
     CATEGORY = 'diagnostics/anima'
 
-    def overlay(self, images, token_map, diagnostic_directory, attention_words, alpha, caption):
+    def overlay(self, images, token_map, diagnostic_directory, attention_words, view_mode, alpha, caption):
         session = Path(diagnostic_directory)
         cfg = json.loads((session / 'session.json').read_text(encoding='utf-8'))
         cmap = cfg.get('colormap', 'turbo')
         overlays, heatmaps, info = [], [], []
+        show_global = view_mode in ('global', 'global + individual')
+        show_individual = view_mode in ('individual', 'global + individual')
 
         for batch_index in range(images.shape[0]):
             base = images[batch_index].detach().cpu().float().clamp(0, 1)
             h, w = int(base.shape[0]), int(base.shape[1])
             for word in _words(attention_words):
-                raw, ids = _word_global_map(session, token_map, word, batch_index)
-                if raw is None:
-                    raise RuntimeError(f'No DAAM maps found for word {word!r}; mapped token ids={ids}')
-                resized = _resize_to_image(raw, h, w).cpu().numpy()
-                norm = _minmax(resized)  # exactly once, after global word aggregation + resize
-                heat = torch.from_numpy(_rgb(norm, cmap).astype(np.float32) / 255.0)
-                over = ((1.0 - float(alpha)) * base + float(alpha) * heat).clamp(0, 1)
-                label = f'{word} tokens {ids}'
-                if caption:
-                    over = _caption(over, label)
-                overlays.append(over)
-                heatmaps.append(heat)
-                info.append(label)
+                if show_global:
+                    raw, ids = _word_global_map(session, token_map, word, batch_index)
+                    if raw is None:
+                        raise RuntimeError(f'No DAAM maps found for word {word!r}; mapped token ids={ids}')
+                    label = f'GLOBAL {word} tokens {ids}'
+                    over, heat, norm = _make_overlay(base, raw, h, w, cmap, alpha, caption, label)
+                    overlays.append(over)
+                    heatmaps.append(heat)
+                    info.append(label)
+                    global_dir = session / 'global'
+                    global_dir.mkdir(exist_ok=True)
+                    np.save(global_dir / f'batch{batch_index:02d}_word-{_slug(word)}_raw.npy', raw.astype(np.float32))
+                    Image.fromarray(_rgb(norm, cmap), 'RGB').save(global_dir / f'batch{batch_index:02d}_word-{_slug(word)}_heatmap.png')
 
-                global_dir = session / 'global'
-                global_dir.mkdir(exist_ok=True)
-                np.save(global_dir / f'batch{batch_index:02d}_word-{_slug(word)}_raw.npy', raw.astype(np.float32))
-                Image.fromarray(_rgb(norm, cmap), 'RGB').save(global_dir / f'batch{batch_index:02d}_word-{_slug(word)}_heatmap.png')
+                if show_individual:
+                    items, ids = _word_individual_maps(session, token_map, word, batch_index)
+                    if not items:
+                        raise RuntimeError(f'No individual DAAM maps found for word {word!r}; mapped token ids={ids}')
+                    individual_dir = session / 'individual'
+                    individual_dir.mkdir(exist_ok=True)
+                    for item in items:
+                        ci = item['call_index']
+                        rh, rw = item['resolution']
+                        sigma = item['sigma']
+                        used = item['token_ids']
+                        label = f'CALL {ci} res {rh}x{rw} sigma {sigma:.4g} {word} tokens {used}' if sigma is not None else f'CALL {ci} res {rh}x{rw} {word} tokens {used}'
+                        over, heat, norm = _make_overlay(base, item['raw'], h, w, cmap, alpha, caption, label)
+                        overlays.append(over)
+                        heatmaps.append(heat)
+                        info.append(label)
+                        stem = f'batch{batch_index:02d}_word-{_slug(word)}_call{ci:04d}_res{rh}x{rw}'
+                        np.save(individual_dir / f'{stem}_raw.npy', item['raw'].astype(np.float32))
+                        Image.fromarray(_rgb(norm, cmap), 'RGB').save(individual_dir / f'{stem}_heatmap.png')
 
         if not overlays:
             raise RuntimeError('No overlay images produced.')
