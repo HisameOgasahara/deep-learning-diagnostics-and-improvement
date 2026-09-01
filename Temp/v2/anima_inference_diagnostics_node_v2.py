@@ -3,7 +3,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
 
 _RECORDER = {}
 
@@ -286,6 +287,61 @@ def _record_cross(q, k, opt):
         })
 
 
+def _load_word_aggregate(session_dir, word, aggregation='mean'):
+    session = Path(session_dir)
+    records_path = session / 'records.jsonl'
+    if not records_path.exists():
+        raise RuntimeError(f'No records.jsonl in diagnostic session: {session}')
+    arrays = []
+    for line in records_path.read_text(encoding='utf-8').splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get('kind') != 'cross_attention_word_v2' or rec.get('attention_word') != word:
+            continue
+        p = Path(rec.get('raw_npz', ''))
+        if not p.exists():
+            candidate = session / 'raw' / p.name
+            p = candidate if candidate.exists() else p
+        if not p.exists():
+            continue
+        with np.load(p) as z:
+            arrays.append(z['aggregate_ratio'].astype(np.float32))
+    if not arrays:
+        raise RuntimeError(f'No attention maps found for word {word!r} in {session}')
+    shapes = {a.shape for a in arrays}
+    if len(shapes) != 1:
+        raise RuntimeError(f'Attention map shapes differ for {word!r}: {sorted(shapes)}')
+    stack = np.stack(arrays, axis=0)
+    return np.median(stack, axis=0) if aggregation == 'median' else stack.mean(axis=0)
+
+
+def _resize_rgb_array(rgb, height, width):
+    t = torch.from_numpy(np.asarray(rgb, np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+    t = F.interpolate(t, size=(height, width), mode='bicubic', align_corners=False)
+    return t.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0)
+
+
+def _add_caption(image_tensor, text):
+    arr = (image_tensor.detach().cpu().clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+    img = Image.fromarray(arr, 'RGB')
+    draw = ImageDraw.Draw(img)
+    try:
+        box = draw.textbbox((0, 0), text)
+        tw, th = box[2] - box[0], box[3] - box[1]
+    except Exception:
+        tw, th = 8 * len(text), 12
+    pad = 6
+    x = max(4, (img.width - tw) // 2)
+    y = max(4, img.height - th - pad * 2)
+    draw.rectangle((x - pad, y - pad, x + tw + pad, y + th + pad), fill=(0, 0, 0))
+    draw.text((x, y), text, fill=(255, 255, 255))
+    return torch.from_numpy(np.asarray(img).astype(np.float32) / 255.0)
+
+
 def _install_hook():
     try:
         from comfy.ldm.cosmos.predict2 import Attention as A
@@ -295,6 +351,7 @@ def _install_hook():
     if getattr(A, '_anima_diag_v2_hook_installed', False):
         return
     original = A.compute_qkv
+
     def wrapped(self, x, context=None, rope_emb=None, transformer_options={}):
         q, k, v = original(self, x, context=context, rope_emb=rope_emb, transformer_options=transformer_options)
         if not self.is_selfattn:
@@ -305,6 +362,7 @@ def _install_hook():
                 if sid in _RECORDER:
                     _append(_RECORDER[sid], {'kind': 'diagnostic_error', 'error': 'cross:' + repr(e)})
         return q, k, v
+
     A.compute_qkv = wrapped
     A._anima_diag_v2_hook_installed = True
     A._anima_diag_v2_original_compute_qkv = original
@@ -321,6 +379,7 @@ class AnimaTextEncodeWithTokenMapV2:
             'clip': ('CLIP',),
             'text': ('STRING', {'multiline': True, 'dynamicPrompts': True}),
         }}
+
     RETURN_TYPES = ('CONDITIONING', 'ANIMA_TOKEN_MAP', 'STRING')
     RETURN_NAMES = ('conditioning', 'token_map', 'mapping_text')
     FUNCTION = 'encode'
@@ -353,6 +412,7 @@ class AnimaTokenMapViewerV2:
     @classmethod
     def INPUT_TYPES(cls):
         return {'required': {'token_map': ('ANIMA_TOKEN_MAP', {'forceInput': True})}}
+
     RETURN_TYPES = ('STRING',)
     RETURN_NAMES = ('mapping_text',)
     FUNCTION = 'show'
@@ -381,6 +441,7 @@ class AnimaAttentionDiagnosticsV2:
             'colormap': (['inferno', 'viridis', 'magma', 'plasma', 'gray'], {'default': 'inferno'}),
             'output_root': ('STRING', {'default': '/content/anima_diagnostics_v2'}),
         }}
+
     RETURN_TYPES = ('MODEL', 'STRING', 'STRING')
     RETURN_NAMES = ('model', 'diagnostic_directory', 'selected_word_mapping')
     FUNCTION = 'patch'
@@ -429,28 +490,84 @@ class AnimaAttentionDiagnosticsV2:
 
         m = model.clone()
         old = m.model_options.get('model_function_wrapper')
+
         def wrapper(apply_model, args):
             c = args['c'].copy()
             with st['lock']:
-                ci = st['call_index']; st['call_index'] += 1
+                ci = st['call_index']
+                st['call_index'] += 1
             sigma = float(args['timestep'].max().detach().cpu())
             to = c.get('transformer_options', {}).copy()
-            to.update({'anima_diag_v2_session': sid, 'anima_diag_v2_call_index': ci, 'anima_diag_v2_sigma': sigma})
+            to.update({
+                'anima_diag_v2_session': sid,
+                'anima_diag_v2_call_index': ci,
+                'anima_diag_v2_sigma': sigma,
+            })
             c['transformer_options'] = to
             st['input_shapes'][ci] = list(args['input'].shape)
             return old(apply_model, args | {'c': c}) if old is not None else apply_model(args['input'], args['timestep'], **c)
+
         m.set_model_unet_function_wrapper(wrapper)
         print(f'[AnimaDiagnosticsV2] session={sid} words={word_indices} blocks={sorted(blocks)}')
         return (m, str(out), selected_mapping)
+
+
+class AnimaAttentionOverlayV2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {'required': {
+            'images': ('IMAGE',),
+            'diagnostic_directory': ('STRING', {'forceInput': True}),
+            'attention_words': ('STRING', {'multiline': True, 'default': 'girl'}),
+            'alpha': ('FLOAT', {'default': 0.5, 'min': 0.0, 'max': 1.0, 'step': 0.05}),
+            'aggregation': (['mean', 'median'], {'default': 'mean'}),
+            'caption': ('BOOLEAN', {'default': True}),
+        }}
+
+    RETURN_TYPES = ('IMAGE', 'IMAGE')
+    RETURN_NAMES = ('overlay_images', 'heatmap_images')
+    FUNCTION = 'overlay'
+    CATEGORY = 'diagnostics/anima'
+    DESCRIPTION = 'DAAM-style overlay: generated image + aggregated Anima word attention heatmap.'
+
+    def overlay(self, images, diagnostic_directory, attention_words, alpha, aggregation, caption):
+        words = _parse_words(attention_words)
+        if not words:
+            raise ValueError('attention_words is empty.')
+        session = Path(diagnostic_directory)
+        cfg_path = session / 'session.json'
+        cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+        vmax = float(cfg.get('ratio_vmax', 6.0))
+        cmap = cfg.get('colormap', 'inferno')
+
+        overlays = []
+        heatmaps = []
+        for batch_index in range(images.shape[0]):
+            base = images[batch_index].detach().cpu().float().clamp(0.0, 1.0)
+            h, w = int(base.shape[0]), int(base.shape[1])
+            for word in words:
+                ratio_map = _load_word_aggregate(session, word, aggregation=aggregation)
+                heat_rgb = _resize_rgb_array(_colorize_fixed(ratio_map, vmax, cmap), h, w)
+                overlay = ((1.0 - float(alpha)) * base + float(alpha) * heat_rgb).clamp(0.0, 1.0)
+                if caption:
+                    overlay = _add_caption(overlay, word)
+                overlays.append(overlay)
+                heatmaps.append(heat_rgb)
+
+        if not overlays:
+            raise RuntimeError('No overlay images were produced.')
+        return (torch.stack(overlays, dim=0), torch.stack(heatmaps, dim=0))
 
 
 NODE_CLASS_MAPPINGS = {
     'AnimaTextEncodeWithTokenMapV2': AnimaTextEncodeWithTokenMapV2,
     'AnimaTokenMapViewerV2': AnimaTokenMapViewerV2,
     'AnimaAttentionDiagnosticsV2': AnimaAttentionDiagnosticsV2,
+    'AnimaAttentionOverlayV2': AnimaAttentionOverlayV2,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     'AnimaTextEncodeWithTokenMapV2': 'Anima Text Encode + Token Map V2',
     'AnimaTokenMapViewerV2': 'Anima Token Map Viewer V2',
     'AnimaAttentionDiagnosticsV2': 'Anima Attention Diagnostics V2',
+    'AnimaAttentionOverlayV2': 'Anima Attention Overlay V2',
 }
