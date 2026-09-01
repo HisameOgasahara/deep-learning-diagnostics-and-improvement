@@ -1,64 +1,89 @@
 from pathlib import Path
-import json, re
+import json
 import numpy as np
 import pandas as pd
 from PIL import Image
 
-ROOT=Path('/content/anima_diagnostics_v2')
-sessions=sorted([p for p in ROOT.glob('*') if p.is_dir()],key=lambda p:p.stat().st_mtime)
-if not sessions: raise RuntimeError('No v2 diagnostic session found.')
-session=sessions[-1]
-rows=[]
-p=session/'records.jsonl'
-if p.exists():
-    for line in p.read_text(encoding='utf-8').splitlines():
-        try: rows.append(json.loads(line))
-        except: pass
-df=pd.DataFrame(rows)
-if len(df): df.to_csv(session/'records.csv',index=False)
+ROOT = Path('/content/anima_diagnostics_v2')
+sessions = sorted([p for p in ROOT.glob('*') if p.is_dir()], key=lambda p: p.stat().st_mtime)
+if not sessions:
+    raise RuntimeError('No v2 diagnostic session found.')
+session = sessions[-1]
 
-def make_gif(files,out,duration=250):
-    ims=[Image.open(x).convert('RGB') for x in files if Path(x).exists()]
-    if ims: ims[0].save(out,save_all=True,append_images=ims[1:],duration=duration,loop=0)
+rows = []
+records_path = session / 'records.jsonl'
+if records_path.exists():
+    for line in records_path.read_text(encoding='utf-8').splitlines():
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
 
-def norm(a,lo=1,hi=99):
-    a=np.asarray(a,np.float32); l,h=np.nanpercentile(a,[lo,hi]); return np.clip((a-l)/(h-l+1e-8),0,1)
+df = pd.DataFrame(rows)
+if len(df):
+    df.to_csv(session / 'records.csv', index=False)
+
+cfg = json.loads((session / 'session.json').read_text(encoding='utf-8')) if (session / 'session.json').exists() else {}
+cmap = cfg.get('colormap', 'turbo')
+
+
+def minmax(a):
+    a = np.asarray(a, np.float32)
+    lo, hi = float(np.nanmin(a)), float(np.nanmax(a))
+    return np.clip((a - lo) / (hi - lo + 1e-8), 0, 1)
+
+
 def rgb(a):
+    n = minmax(a)
     try:
         import matplotlib
-        return (matplotlib.colormaps.get_cmap('inferno')(norm(a))[...,:3]*255).astype(np.uint8)
-    except: return np.repeat((norm(a)[...,None]*255).astype(np.uint8),3,-1)
-def slug(s): return re.sub(r'[^0-9A-Za-z가-힣_-]+','_',str(s)).strip('_')[:64] or 'word'
+        return (matplotlib.colormaps.get_cmap(cmap)(n)[..., :3] * 255).astype(np.uint8)
+    except Exception:
+        return np.repeat((n[..., None] * 255).astype(np.uint8), 3, -1)
 
-# V1-parity token maps: one GIF per token x block over denoising calls.
-tok=df[df['kind']=='token_map'].copy() if len(df) and 'kind' in df.columns else pd.DataFrame()
+
+def resize_np(a, h, w):
+    import torch
+    import torch.nn.functional as F
+    t = torch.from_numpy(np.asarray(a, np.float32))[None, None]
+    return F.interpolate(t, size=(h, w), mode='bicubic', align_corners=False)[0, 0].numpy()
+
+
+tok = df[df['kind'] == 'timestep_token_map'].copy() if len(df) and 'kind' in df.columns else pd.DataFrame()
+outdir = session / 'global_tokens'
+outdir.mkdir(parents=True, exist_ok=True)
+summary = []
+
 if len(tok):
-    gifdir=session/'token_gifs'; gifdir.mkdir(parents=True,exist_ok=True)
-    for (token,block),g in tok.groupby(['text_token_index','block']):
-        g=g.sort_values('call_index')
-        make_gif(g['png'].tolist(),gifdir/f'block{int(block):02d}_token{int(token):03d}.gif')
+    for (batch, token), g in tok.groupby(['batch_index', 'text_token_index']):
+        arrays = []
+        for p in g.sort_values('call_index')['raw_npy']:
+            p = Path(p)
+            if not p.exists():
+                p = session / 'timestep_raw' / p.name
+            if p.exists():
+                arrays.append(np.load(p).astype(np.float32))
+        if not arrays:
+            continue
+        h = max(a.shape[0] for a in arrays)
+        w = max(a.shape[1] for a in arrays)
+        aligned = [resize_np(a, h, w) if a.shape != (h, w) else a for a in arrays]
+        global_map = np.stack(aligned, axis=0).sum(axis=0)
+        stem = f'batch{int(batch):02d}_token{int(token):03d}'
+        np.save(outdir / f'{stem}_raw.npy', global_map)
+        Image.fromarray(rgb(global_map), 'RGB').save(outdir / f'{stem}_relative.png')
+        summary.append({
+            'batch_index': int(batch),
+            'text_token_index': int(token),
+            'num_timestep_maps': len(arrays),
+            'shape': list(global_map.shape),
+        })
 
-# Global token summaries are separate so subtoken behavior is never hidden by word averaging.
-if len(tok):
-    outdir=session/'token_global'; outdir.mkdir(parents=True,exist_ok=True)
-    for token,g in tok.groupby('text_token_index'):
-        arr=[np.load(x).astype(np.float32) for x in g['raw_npy'] if Path(x).exists()]
-        if arr:
-            m=np.mean(np.stack(arr),0); np.save(outdir/f'token{int(token):03d}_mean.npy',m)
-            Image.fromarray(rgb(m),'RGB').save(outdir/f'token{int(token):03d}_mean_relative.png')
+if summary:
+    pd.DataFrame(summary).to_csv(session / 'global_token_index.csv', index=False)
 
-word=df[df['kind']=='word_map'].copy() if len(df) and 'kind' in df.columns else pd.DataFrame()
-if len(word):
-    gifdir=session/'word_gifs'; gifdir.mkdir(parents=True,exist_ok=True)
-    for (name,block),g in word.groupby(['attention_word','block']):
-        g=g.sort_values('call_index'); make_gif(g['png'].tolist(),gifdir/f'block{int(block):02d}_word-{slug(name)}.gif')
-    outdir=session/'word_global'; outdir.mkdir(parents=True,exist_ok=True)
-    for name,g in word.groupby('attention_word'):
-        arr=[np.load(x).astype(np.float32) for x in g['raw_npy'] if Path(x).exists()]
-        if arr:
-            m=np.mean(np.stack(arr),0); np.save(outdir/f'word-{slug(name)}_mean.npy',m)
-            Image.fromarray(rgb(m),'RGB').save(outdir/f'word-{slug(name)}_mean_relative.png')
-
-print('session:',session)
-print('token maps:',len(tok),'word maps:',len(word))
-print('First inspect token_gifs/: token x block x timestep, then compare token_global/ and word_global/.')
+print('session:', session)
+print('timestep token maps:', len(tok))
+print('global token maps:', len(summary))
+print('aggregation: layer-mean per timestep/resolution was done during sampling; here timestep/resolution maps are summed, matching DAAM GlobalHeatMap semantics.')
+print('word maps are intentionally produced later by Anima Attention Overlay V2 from arbitrary attention_words.')
