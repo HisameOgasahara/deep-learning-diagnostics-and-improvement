@@ -1,0 +1,74 @@
+name: Apply ChatGPT practice fixes
+
+on:
+  push:
+    branches:
+      - chatgpt-practice-fix
+    paths:
+      - .stage/practice_fix/ready
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt-practice-fix
+          fetch-depth: 0
+
+      - name: Reconstruct verified archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .stage/practice_fix/chunk_*.txt > /tmp/practice_fix.tar.gz.b64
+          base64 --decode /tmp/practice_fix.tar.gz.b64 > /tmp/practice_fix.tar.gz
+          echo "9c53e9080fb184a7f30df41df9fb2557b7ecbe9c560cc19e8c5020987dfc0bc5  /tmp/practice_fix.tar.gz" | sha256sum --check -
+          tar -xzf /tmp/practice_fix.tar.gz
+
+      - name: Verify notebooks and readability
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          files = [
+              "08_attention_core.ipynb",
+              "09_attention_advanced.ipynb",
+              "10_moe_and_routing.ipynb",
+              "16_conditioning_and_dit.ipynb",
+              "19_3d_pointcloud_and_detection.ipynb",
+              "23_pi0_and_fast.ipynb",
+          ]
+          for name in files:
+              path = Path("practice") / name
+              nb = json.loads(path.read_text())
+              for cell in nb["cells"]:
+                  if cell["cell_type"] != "code":
+                      continue
+                  src = cell["source"] if isinstance(cell["source"], str) else "".join(cell["source"])
+                  for line in src.splitlines():
+                      if len(line) > 100:
+                          raise SystemExit(f"long code line in {name}: {len(line)}")
+          print("readability: PASS")
+          PY
+
+      - name: Commit exact notebook bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ChatGPT"
+          git config user.email "chatgpt@users.noreply.github.com"
+          git add practice/08_attention_core.ipynb \
+                  practice/09_attention_advanced.ipynb \
+                  practice/10_moe_and_routing.ipynb \
+                  practice/16_conditioning_and_dit.ipynb \
+                  practice/19_3d_pointcloud_and_detection.ipynb \
+                  practice/23_pi0_and_fast.ipynb
+          git rm -r .stage/practice_fix .github/workflows/chatgpt-practice-fix.yml
+          git commit -m "Fix remaining practice architecture fidelity"
+          git push origin HEAD:chatgpt-practice-fix
