@@ -1,0 +1,187 @@
+name: Practice repair reconstruction
+
+on:
+  push:
+    branches:
+      - practice-repair-staging-20260914
+
+permissions:
+  contents: write
+
+jobs:
+  reconstruct-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: practice-repair-staging-20260914
+          fetch-depth: 0
+
+      - name: Reconstruct verified files on top of main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          staging="$GITHUB_WORKSPACE"
+          destination="$(mktemp -d)/main"
+          git worktree add "$destination" origin/main
+
+          export REPAIR_STAGING="$staging"
+          export REPAIR_DESTINATION="$destination"
+
+          python - <<'PY'
+          import ast
+          import base64
+          import gzip
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+
+          staging = pathlib.Path(os.environ["REPAIR_STAGING"])
+          destination = pathlib.Path(os.environ["REPAIR_DESTINATION"])
+
+          specs = {
+              "03": (
+                  "practice/03_minimal_ai_systems_overview.ipynb",
+                  "16b02b0f482a429dce5ad9bfcdaadb6d81413999c3242b99be727a62b7660004",
+              ),
+              "11": (
+                  "practice/11_optimizer_updates.ipynb",
+                  "ea855e4dfa211f2c1f39d89eb629b350be06a9f891bcd75aefeebbd509597836",
+              ),
+              "13": (
+                  "practice/13_vision_transformer_blocks.ipynb",
+                  "75c38a97bd5ab6412f51550696f3f88158a1e8accab9ff9821637f5d04e4687d",
+              ),
+              "15": (
+                  "practice/15_samplers_and_solvers.ipynb",
+                  "adb4bf66c70b3905884d38f91fdbfb7ecc82a334d69423b1cb65cb62a51e1491",
+              ),
+              "16": (
+                  "practice/16_conditioning_and_dit.ipynb",
+                  "704ff400d5b9dbf9e1fc951dc2db06c3c9d223861e5b516e53513aa8982e4980",
+              ),
+              "18": (
+                  "practice/18_3d_geometry_and_rendering.ipynb",
+                  "5ea38cba3a101f71015d35e66d7de8e2d88c4eae725cd5195e4d2e87266d3036",
+              ),
+              "22": (
+                  "practice/22_robotics_action_policies.ipynb",
+                  "7546ce6c3eb01dfee5b929ebcbae8955e4449101ef198986295a05d52344bcc1",
+              ),
+              "readme": (
+                  "practice/README.md",
+                  "689b248b5fced42dfd38b280fb0dafa1b6fdcf6efbafc18dbc000c765c2ede51",
+              ),
+          }
+
+          notebook_paths = []
+
+          for slug, (relative_path, expected_sha256) in specs.items():
+              part_dir = staging / ".repair_gz" / slug
+              parts = sorted(part_dir.glob("*.b64"))
+              if not parts:
+                  raise RuntimeError(f"missing transfer chunks for {slug}")
+
+              encoded = "".join(part.read_text().strip() for part in parts)
+              payload = gzip.decompress(base64.b64decode(encoded))
+              actual_sha256 = hashlib.sha256(payload).hexdigest()
+
+              if actual_sha256 != expected_sha256:
+                  raise RuntimeError(
+                      f"SHA256 mismatch for {relative_path}: "
+                      f"{actual_sha256} != {expected_sha256}"
+                  )
+
+              output_path = destination / relative_path
+              output_path.parent.mkdir(parents=True, exist_ok=True)
+              output_path.write_bytes(payload)
+
+              if relative_path.endswith(".ipynb"):
+                  notebook_paths.append(output_path)
+
+          one_line_suite = re.compile(
+              r"^(if|for|while|with|try|except|def|class)\b.*:\s+\S+"
+          )
+
+          for notebook_path in notebook_paths:
+              notebook = json.loads(notebook_path.read_text())
+
+              for cell_index, cell in enumerate(notebook["cells"]):
+                  if cell.get("cell_type") != "code":
+                      continue
+
+                  source = cell.get("source", "")
+                  if isinstance(source, list):
+                      source = "".join(source)
+
+                  compile(
+                      source,
+                      f"{notebook_path.name}:cell-{cell_index}",
+                      "exec",
+                  )
+
+                  for line_index, line in enumerate(source.splitlines(), 1):
+                      stripped = line.strip()
+
+                      if len(line) > 110:
+                          raise RuntimeError(
+                              f"overlong code line: {notebook_path.name} "
+                              f"cell {cell_index} line {line_index}"
+                          )
+
+                      if ";" in line and not stripped.startswith("#"):
+                          raise RuntimeError(
+                              f"semicolon-packed code: {notebook_path.name} "
+                              f"cell {cell_index} line {line_index}"
+                          )
+
+                      if one_line_suite.match(stripped):
+                          raise RuntimeError(
+                              f"one-line compound statement: "
+                              f"{notebook_path.name} cell {cell_index} "
+                              f"line {line_index}"
+                          )
+
+                  tree = ast.parse(source)
+                  statement_lines = {}
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.stmt) and hasattr(node, "lineno"):
+                          statement_lines[node.lineno] = (
+                              statement_lines.get(node.lineno, 0) + 1
+                          )
+
+                  packed_lines = [
+                      line_number
+                      for line_number, count in statement_lines.items()
+                      if count > 1
+                  ]
+                  if packed_lines:
+                      raise RuntimeError(
+                          f"multiple statements on one line in "
+                          f"{notebook_path.name}: {packed_lines}"
+                      )
+
+          print("reconstruction, SHA256, syntax, and readability checks: PASS")
+          PY
+
+          cd "$destination"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            practice/03_minimal_ai_systems_overview.ipynb \
+            practice/11_optimizer_updates.ipynb \
+            practice/13_vision_transformer_blocks.ipynb \
+            practice/15_samplers_and_solvers.ipynb \
+            practice/16_conditioning_and_dit.ipynb \
+            practice/18_3d_geometry_and_rendering.ipynb \
+            practice/22_robotics_action_policies.ipynb \
+            practice/README.md
+
+          git diff --cached --check
+          git commit -m "Fix practice architecture fidelity and readability"
+          git push origin HEAD:main
