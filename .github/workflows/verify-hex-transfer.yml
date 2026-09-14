@@ -1,0 +1,47 @@
+name: Verify hex repair transfer
+
+on:
+  push:
+    branches:
+      - practice-repair-staging-20260914
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: practice-repair-staging-20260914
+      - name: Verify 03 and 11 reconstructed hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import pathlib
+          import zlib
+
+          specs = {
+              "03": (
+                  pathlib.Path(".repair_hex3/03"),
+                  "16b02b0f482a429dce5ad9bfcdaadb6d81413999c3242b99be727a62b7660004",
+              ),
+              "11": (
+                  pathlib.Path(".repair_hex4/11"),
+                  "ea855e4dfa211f2c1f39d89eb629b350be06a9f891bcd75aefeebbd509597836",
+              ),
+          }
+
+          for slug, (directory, expected) in specs.items():
+              encoded = "".join(
+                  path.read_text().strip()
+                  for path in sorted(directory.glob("*.hex"))
+              )
+              payload = zlib.decompress(bytes.fromhex(encoded))
+              actual = hashlib.sha256(payload).hexdigest()
+              print(slug, len(encoded), actual)
+              if actual != expected:
+                  raise RuntimeError(f"{slug}: {actual} != {expected}")
+
+          print("HEX TRANSFER PASS")
+          PY
