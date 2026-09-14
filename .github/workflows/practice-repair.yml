@@ -76,7 +76,13 @@ jobs:
           }
 
           for slug, (relative_path, expected_sha256) in specs.items():
-              part_dir = staging / ".repair_gz" / slug
+              small_chunk_dir = staging / ".repair_gz2" / slug
+              original_chunk_dir = staging / ".repair_gz" / slug
+              part_dir = (
+                  small_chunk_dir
+                  if small_chunk_dir.exists()
+                  else original_chunk_dir
+              )
               parts = sorted(part_dir.glob("*.b64"))
               if not parts:
                   raise RuntimeError(f"missing transfer chunks for {slug}")
@@ -111,21 +117,23 @@ jobs:
           import re
 
           destination = pathlib.Path(os.environ["REPAIR_DESTINATION"])
-          notebook_paths = [
-              destination / "practice/03_minimal_ai_systems_overview.ipynb",
-              destination / "practice/11_optimizer_updates.ipynb",
-              destination / "practice/13_vision_transformer_blocks.ipynb",
-              destination / "practice/15_samplers_and_solvers.ipynb",
-              destination / "practice/16_conditioning_and_dit.ipynb",
-              destination / "practice/18_3d_geometry_and_rendering.ipynb",
-              destination / "practice/22_robotics_action_policies.ipynb",
+          notebook_names = [
+              "03_minimal_ai_systems_overview.ipynb",
+              "11_optimizer_updates.ipynb",
+              "13_vision_transformer_blocks.ipynb",
+              "15_samplers_and_solvers.ipynb",
+              "16_conditioning_and_dit.ipynb",
+              "18_3d_geometry_and_rendering.ipynb",
+              "22_robotics_action_policies.ipynb",
           ]
           one_line_suite = re.compile(
               r"^(if|for|while|with|try|except|def|class)\b.*:\s+\S+"
           )
 
-          for notebook_path in notebook_paths:
+          for name in notebook_names:
+              notebook_path = destination / "practice" / name
               notebook = json.loads(notebook_path.read_text())
+
               for cell_index, cell in enumerate(notebook["cells"]):
                   if cell.get("cell_type") != "code":
                       continue
@@ -134,34 +142,28 @@ jobs:
                   if isinstance(source, list):
                       source = "".join(source)
 
-                  compile(
-                      source,
-                      f"{notebook_path.name}:cell-{cell_index}",
-                      "exec",
-                  )
+                  compile(source, f"{name}:cell-{cell_index}", "exec")
 
                   for line_index, line in enumerate(source.splitlines(), 1):
                       stripped = line.strip()
                       if len(line) > 110:
                           raise RuntimeError(
-                              f"overlong code line: {notebook_path.name} "
-                              f"cell {cell_index} line {line_index}"
+                              f"overlong code line: {name} cell {cell_index} "
+                              f"line {line_index}"
                           )
                       if ";" in line and not stripped.startswith("#"):
                           raise RuntimeError(
-                              f"semicolon-packed code: {notebook_path.name} "
-                              f"cell {cell_index} line {line_index}"
+                              f"semicolon-packed code: {name} cell {cell_index} "
+                              f"line {line_index}"
                           )
                       if one_line_suite.match(stripped):
                           raise RuntimeError(
-                              f"one-line compound statement: "
-                              f"{notebook_path.name} cell {cell_index} "
-                              f"line {line_index}"
+                              f"one-line compound statement: {name} "
+                              f"cell {cell_index} line {line_index}"
                           )
 
-                  tree = ast.parse(source)
                   statement_lines = {}
-                  for node in ast.walk(tree):
+                  for node in ast.walk(ast.parse(source)):
                       if isinstance(node, ast.stmt) and hasattr(node, "lineno"):
                           statement_lines[node.lineno] = (
                               statement_lines.get(node.lineno, 0) + 1
@@ -174,8 +176,8 @@ jobs:
                   ]
                   if packed_lines:
                       raise RuntimeError(
-                          f"multiple statements on one line in "
-                          f"{notebook_path.name}: {packed_lines}"
+                          f"multiple statements on one line in {name}: "
+                          f"{packed_lines}"
                       )
 
           print("syntax and readability: PASS")
