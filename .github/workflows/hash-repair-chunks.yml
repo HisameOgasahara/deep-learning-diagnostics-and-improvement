@@ -1,0 +1,22 @@
+name: Hash repair chunks
+
+on:
+  push:
+    branches:
+      - practice-repair-staging-20260914
+
+jobs:
+  hash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: practice-repair-staging-20260914
+      - name: Hash 11 chunks
+        run: |
+          set -euo pipefail
+          wc -c .repair_gz2/11/*.b64
+          sha256sum .repair_gz2/11/*.b64
+          cat .repair_gz2/11/*.b64 | base64 -d > /tmp/11.gz
+          sha256sum /tmp/11.gz
+          gzip -t /tmp/11.gz
